@@ -1,3 +1,5 @@
+[![LICENSE](https://img.shields.io/badge/license-Anti%20996-blue.svg)](https://github.com/framlog/libcps/blob/master/LICENSE) 
+
 libcps is a head-only library for Continuation-Passing-Style(CPS) programming based on libev.
 
 ### Requirements:
