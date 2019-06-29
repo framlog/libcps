@@ -12,6 +12,7 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
+#include <chrono>
 
 #ifdef LOG_EXCEPTION
 #include <iostream>
@@ -25,7 +26,6 @@
 // NB:
 // 1. Public methods of Future aren't thread safe and can only be
 // invoked on the thread that ev_loop runs to avoid race condition.
-// 2. Doesn't support return Future<void> in Future::Then currently.
 
 namespace cps {
 
@@ -41,7 +41,7 @@ class AsyncNotifier;
 using FutureContext = AsyncNotifier;
 template <typename T> class Future;
 template <typename T> class SharedFuture;
-template <typename T, template<typename> class FutureType = Future> class Promise;
+template <typename T, template<typename> class FutureT = Future> class Promise;
 template <typename... Futures> class WhenAll;
 template <typename T> class WhenEach;
 template <typename... Futures>
@@ -69,12 +69,12 @@ public:
   virtual void GetNotified() = 0;
 
 protected:
-  Futurable() = default;
+  Futurable() noexcept = default;
 };
 
 class AsyncNotifier final {
 public:
-  AsyncNotifier(struct ev_loop *loop) : loop_(loop), last_freezed_size_(0) {
+  AsyncNotifier(struct ev_loop *loop) noexcept : loop_(loop), last_freezed_size_(0) {
     ev_async_init(&async_, OnNotify);
     async_.data = this;
     ev_async_start(loop, &async_);
@@ -86,6 +86,10 @@ public:
   void Chained(Futurable *future) { futures_.push_back(future); }
 
   void FreezeOrder() { last_freezed_size_ = futures_.size(); }
+
+  void RunTimer(struct ev_timer *timer) {
+      ev_timer_start(loop_, timer);
+  }
 
   void Remove(Futurable *future) {
     for (auto iter = futures_.begin(); iter != futures_.end(); ++iter) {
@@ -154,7 +158,7 @@ MakeReadyFuture(std::shared_ptr<AsyncNotifier> notifier, T &v);
 template <typename T, template<typename> class FutureType = Future>
 std::shared_ptr<FutureType<T>>
 MakeReadyFuture(std::shared_ptr<AsyncNotifier> notifier, T &&v);
-template <template<typename> class FutureType = Future>
+template<template<typename> class FutureType = Future>
 std::shared_ptr<FutureType<void>>
 MakeReadyFuture(std::shared_ptr<AsyncNotifier> notifier);
 
@@ -186,6 +190,10 @@ struct Futurize<std::shared_ptr<WhenAll<std::shared_ptr<Futures>...>>> {
   }
 };
 
+template<typename Fn, typename Rep, typename Period>
+auto Delay(std::shared_ptr<FutureContext> ctx, 
+        const std::chrono::duration<Rep, Period>& duration, Fn&& operation) -> std::shared_ptr<typename Futurize<decltype(std::declval<Fn>()())>::type>;
+
 template <typename T> class Future : public Futurable {
 public:
   using Output = T;
@@ -203,8 +211,7 @@ public:
   PIN_TYPE(Future);
 
   optional<T> Get(bool block = true) const {
-    while (block && !IsReady()) { /* NULL */
-    }
+    while (block && !IsReady()) {}
     return FutureState::Pending != state_.load() ? value_ : optional<T>();
   }
 
@@ -218,11 +225,6 @@ public:
 
   bool IsError() const override final {
     return FutureState::Error == state_.load();
-  }
-
-  void CancelNotify() {
-    notifier_->Remove(this);
-    Unref();
   }
 
   // NB: Call this method on the same future multiple times is undefined
@@ -246,21 +248,8 @@ public:
                              {});
   }
 
-protected:
-  friend class Promise<T>;
-  friend class Promise<T, SharedFuture>;
-
-  template <typename O, template<typename> class FutureType>>
-  std::shared_ptr<FutureType<O>> friend MakeReadyFuture(
-      std::shared_ptr<AsyncNotifier> notifier, O &v);
-  template <typename O, template<typename> class FutureType>
-  std::shared_ptr<FutureType<O>> friend MakeReadyFuture(
-      std::shared_ptr<AsyncNotifier> notifier, O &&v);
-  template <template<typename> class FutureType>
-  std::shared_ptr<FutureType<void>> friend MakeReadyFuture(
-      std::shared_ptr<AsyncNotifier> notifier);
-
-  Future(std::shared_ptr<AsyncNotifier> notifier) noexcept
+  // TODO: These methods should be moved to protected scope
+  Future(std::shared_ptr<AsyncNotifier> notifier)
       : state_(FutureState::Pending), notifier_(notifier) {
     notifier_->Chained(this);
   }
@@ -269,6 +258,42 @@ protected:
     assert(self.get() == this);
     self_ = self;
   }
+
+  bool SetValue(const T &v) {
+    if (FutureState::Pending == state_.load()) {
+      assert(!value_);
+      value_.emplace(v);
+      state_.store(FutureState::Done);
+      notifier_->Notify();
+      return true;
+    }
+    return false;
+  }
+
+  bool SetValue(T &&v) {
+    if (FutureState::Pending == state_.load()) {
+      assert(!value_);
+      value_.emplace(std::move(v));
+      state_.store(FutureState::Done);
+      notifier_->Notify();
+      return true;
+    }
+    return false;
+  }
+
+protected:
+  friend class Promise<T>;
+  friend class Promise<T, SharedFuture>;
+
+  template <typename O, template<typename> class FutureType>
+  std::shared_ptr<FutureType<O>> friend MakeReadyFuture(
+      std::shared_ptr<AsyncNotifier> notifier, O &v);
+  template <typename O, template<typename> class FutureType>
+  std::shared_ptr<FutureType<O>> friend MakeReadyFuture(
+      std::shared_ptr<AsyncNotifier> notifier, O &&v);
+  template <template<typename> class FutureType>
+  std::shared_ptr<FutureType<void>> friend MakeReadyFuture(
+      std::shared_ptr<AsyncNotifier> notifier);
 
   void GetNotified() override {
     assert(FutureState::Pending != state_.load());
@@ -295,28 +320,6 @@ protected:
   template <typename Fn, typename ErrFn>
   auto _Then(Fn &&handle, ErrFn &&err_handle, std::false_type /* isn't void */)
       -> std::shared_ptr<ThenFnRet<Fn>>;
-
-  bool SetValue(const T &v) {
-    if (FutureState::Pending == state_.load()) {
-      assert(!value_);
-      value_.emplace(v);
-      state_.store(FutureState::Done);
-      notifier_->Notify();
-      return true;
-    }
-    return false;
-  }
-
-  bool SetValue(T &&v) {
-    if (FutureState::Pending == state_.load()) {
-      assert(!value_);
-      value_.emplace(std::move(v));
-      state_.store(FutureState::Done);
-      notifier_->Notify();
-      return true;
-    }
-    return false;
-  }
 
   bool SetError() {
     if (FutureState::Pending == state_.load()) {
@@ -350,8 +353,7 @@ public:
 
   // NB: Calling Future<void>::Get(false) equals to a nop.
   void Get(bool block = true) const {
-    while (block && !IsReady()) { /* NULL */
-    }
+    while (block && !IsReady()) {}
   }
 
   bool IsShareTheSameContext(std::shared_ptr<FutureContext> ctx) const {
@@ -364,11 +366,6 @@ public:
 
   bool IsError() const override final {
     return FutureState::Error == state_.load();
-  }
-
-  void CancelNotify() {
-    notifier_->Remove(this);
-    Unref();
   }
 
   // NB: Call this method on the same future multiple times chains
@@ -390,11 +387,31 @@ public:
                              {});
   }
 
+  // TODO: These methods should be moved to protected scope
+  Future(std::shared_ptr<AsyncNotifier> notifier)
+      : state_(FutureState::Pending), notifier_(notifier) {
+    notifier_->Chained(this);
+  }
+
+  void Ref(std::shared_ptr<Future<void>> self) {
+    assert(self.get() == this);
+    self_ = self;
+  }
+
+  bool SetValue() {
+    if (FutureState::Pending == state_.load()) {
+      state_.store(FutureState::Done);
+      notifier_->Notify();
+      return true;
+    }
+    return false;
+  }
+
 protected:
   friend class Promise<void>;
   friend class Promise<void, SharedFuture>;
 
-  template <typename O, template<typename> class FutureType>>
+  template <typename O, template<typename> class FutureType>
   std::shared_ptr<FutureType<O>> friend MakeReadyFuture(
       std::shared_ptr<AsyncNotifier> notifier, O &v);
   template <typename O, template<typename> class FutureType>
@@ -403,11 +420,6 @@ protected:
   template <template<typename> class FutureType>
   std::shared_ptr<FutureType<void>> friend MakeReadyFuture(
       std::shared_ptr<AsyncNotifier> notifier);
-
-  Future(std::shared_ptr<AsyncNotifier> notifier) noexcept
-      : state_(FutureState::Pending), notifier_(notifier) {
-    notifier_->Chained(this);
-  }
 
   template <typename Fn>
   auto _Then(Fn &&handle, std::true_type /* is void */)
@@ -425,11 +437,6 @@ protected:
   auto _Then(Fn &&handle, ErrFn &&err_handle, std::false_type /* isn't void */)
       -> std::shared_ptr<ThenFnRet<Fn>>;
 
-  void Ref(std::shared_ptr<Future<void>> self) {
-    assert(self.get() == this);
-    self_ = self;
-  }
-
   void Unref() { self_.reset(); }
 
   void GetNotified() override {
@@ -438,15 +445,6 @@ protected:
       then_cb_(notifier_, state_.load());
     }
     Unref();
-  }
-
-  bool SetValue() {
-    if (FutureState::Pending == state_.load()) {
-      state_.store(FutureState::Done);
-      notifier_->Notify();
-      return true;
-    }
-    return false;
   }
 
   bool SetError() {
@@ -469,8 +467,7 @@ protected:
 template <typename T> class SharedFuture final : public Future<T> {
 public:
   SharedFuture(std::shared_ptr<AsyncNotifier> notifier)
-      : Future<T>(notifier) { /* NULL */
-  }
+      : Future<T>(notifier) {}
 
   template <typename Fn>
   auto Then(std::shared_ptr<AsyncNotifier> notifier, Fn &&handle)
@@ -496,8 +493,7 @@ private:
 template <> class SharedFuture<void> final : public Future<void> {
 public:
   SharedFuture(std::shared_ptr<AsyncNotifier> notifier)
-      : Future<void>(notifier) { /* NULL */
-  }
+      : Future<void>(notifier) {}
 
   template <typename Fn>
   auto Then(std::shared_ptr<AsyncNotifier> notifier, Fn &&handle)
@@ -521,7 +517,7 @@ private:
 };
 
 template <typename T, template<typename> class FutureT> class Promise {
-  static_assert(std::is_base_of<Futurable, FutureT>::value, "FutureType should be a derived class of Futurable");
+    static_assert(std::is_base_of<Futurable, FutureT<T>>::value, "`FutureT` should be a derived class of `Futurable`");
 public:
   Promise(std::shared_ptr<AsyncNotifier> notifier) noexcept
       : value_(std::shared_ptr<FutureT<T>>(new FutureT<T>(notifier))) {
@@ -538,7 +534,7 @@ private:
 };
 
 template <template<typename> class FutureT> class Promise<void, FutureT> {
-  static_assert(std::is_base_of<Futurable, FutureT>::value, "FutureType should be a derived class of Futurable");
+    static_assert(std::is_base_of<Futurable, FutureT<void>>::value, "`FutureT` should be a derived class of `Futurable`");
 public:
   Promise(std::shared_ptr<AsyncNotifier> notifier) noexcept
       : value_(std::shared_ptr<FutureT<void>>(new FutureT<void>(notifier))) {
@@ -552,6 +548,55 @@ public:
 private:
   std::shared_ptr<FutureT<void>> value_;
 };
+
+template<typename T>
+struct Pipe {
+    void operator()(std::shared_ptr<Future<T>> future, std::shared_ptr<Promise<T>> promise) {
+        future->Then([promise](
+                    auto &&ctx,
+                    const auto &v) noexcept { promise->SetValue(v); },
+                [promise](auto &&ctx) noexcept { promise->SetError(); });
+    }
+};
+
+template<>
+struct Pipe<void>{ 
+    void operator()(std::shared_ptr<Future<void>> future, std::shared_ptr<Promise<void>> promise) {
+        future->Then([promise](auto &&ctx) noexcept { promise->SetValue(); },
+                            [promise](auto &&ctx) noexcept { promise->SetError(); });
+    }
+};
+
+template<typename Fn, typename Rep, typename Period>
+auto Delay(std::shared_ptr<FutureContext> notifier, 
+        const std::chrono::duration<Rep, Period>& duration, Fn&& operation) -> std::shared_ptr<typename Futurize<decltype(std::declval<Fn>()())>::type> {
+    using namespace std::chrono;
+
+    auto promise = std::make_shared<Promise<typename Futurize<decltype(std::declval<Fn>()())>::type::Output>>(notifier);
+    auto ret = promise->GetFuture();
+    auto timer = static_cast<struct ev_timer*>(malloc(sizeof(struct ev_timer)));
+    auto cb = [](struct ev_loop *loop, struct ev_timer *w, int revent) {
+        assert(w->data != nullptr);
+        auto arg = reinterpret_cast<std::tuple<decltype(notifier), decltype(promise), Fn>*>(w->data);
+        try {
+            // The same code as `Future::_Then`...
+            std::get<0>(*arg)->FreezeOrder();
+            auto future = Futurize<decltype(std::declval<Fn>()())>::Apply(std::get<0>(*arg), std::get<2>(*arg)());
+            Pipe<typename decltype(future)::element_type::Output>{}(future, std::get<1>(*arg));
+            if (future->IsShareTheSameContext(std::get<0>(*arg))) {
+                std::get<0>(*arg)->Promote();
+            }
+        } catch (const std::exception &e) {
+            std::get<1>(*arg)->SetError();
+        }
+        delete arg;
+        w->data = nullptr;
+    };
+    ev_timer_init(timer, cb, duration_cast<seconds>(duration).count(), 0);
+    timer->data = new std::tuple<decltype(notifier), decltype(promise), Fn>(notifier, std::move(promise), std::forward<Fn>(operation));
+    notifier->RunTimer(timer);
+    return ret; 
+}
 
 template <typename T>
 template <typename Fn>
@@ -594,10 +639,7 @@ auto Future<T>::_Then(Fn &&handle, std::false_type /* isn't void */)
         notifier->FreezeOrder();
         auto future = Futurize<ThenHandleRet<Fn>>::Apply(
             notifier, handle(notifier, opt.value()));
-        future->Then([promise](
-                         auto &&ctx,
-                         const auto &v) noexcept { promise->SetValue(v); },
-                     [promise](auto &&ctx) noexcept { promise->SetError(); });
+        Pipe<typename decltype(future)::element_type::Output>{}(future, promise);
         if (future->IsShareTheSameContext(notifier)) {
           // NB: we have chained some futures onto the notifier. Thus,
           // in consideration of other futures that already exist on the
@@ -662,10 +704,7 @@ auto Future<T>::_Then(Fn &&handle, ErrFn &&err_handle,
         notifier->FreezeOrder();
         auto future = Futurize<ThenHandleRet<Fn>>::Apply(
             notifier, handle(notifier, opt.value()));
-        future->Then([promise](
-                         auto &&ctx,
-                         const auto &v) noexcept { promise->SetValue(v); },
-                     [promise](auto &&ctx) noexcept { promise->SetError(); });
+        Pipe<typename decltype(future)::element_type::Output>{}(future, promise);
         if (future->IsShareTheSameContext(notifier)) {
           notifier->Promote();
         }
@@ -718,11 +757,7 @@ auto Future<void>::_Then(Fn &&handle, std::false_type /* isn't void */)
         notifier->FreezeOrder();
         auto future =
             Futurize<ThenHandleRet<Fn>>::Apply(notifier, handle(notifier));
-        ;
-        future->Then([promise](
-                         auto &&ctx,
-                         const auto &v) noexcept { promise->SetValue(v); },
-                     [promise](auto &&ctx) noexcept { promise->SetError(); });
+        Pipe<typename decltype(future)::element_type::Output>{}(future, promise);
         if (future->IsShareTheSameContext(notifier)) {
           notifier->Promote();
         }
@@ -779,10 +814,7 @@ auto Future<void>::_Then(Fn &&handle, ErrFn &&err_handle,
         notifier->FreezeOrder();
         auto future =
             Futurize<ThenHandleRet<Fn>>::Apply(notifier, handle(notifier));
-        future->Then([promise](
-                         auto &&ctx,
-                         const auto &v) noexcept { promise->SetValue(v); },
-                     [promise](auto &&ctx) noexcept { promise->SetError(); });
+        Pipe<typename decltype(future)::element_type::Output>{}(future, promise);
         if (future->IsShareTheSameContext(notifier)) {
           notifier->Promote();
         }
@@ -837,30 +869,27 @@ auto SharedFuture<void>::Then(std::shared_ptr<AsyncNotifier> notifier,
 }
 
 // Make a Future<T> that's immediately ready
-template <typename T, template<typename> class FutureType = Future>
+template <typename T, template<typename> class FutureType>
 std::shared_ptr<FutureType<T>>
 MakeReadyFuture(std::shared_ptr<AsyncNotifier> notifier, T &v) {
-  static_assert(std::is_base_of<Futurable, FutureType>::value, "FutureType should be a derived class of Futurable");
   auto ret = std::shared_ptr<FutureType<T>>(new FutureType<T>(notifier));
   ret->Ref(ret);
   ret->SetValue(std::forward<T>(v));
   return ret;
 }
 
-template <typename T, template<typename> class FutureType = Future>
+template <typename T, template<typename> class FutureType>
 std::shared_ptr<FutureType<T>>
 MakeReadyFuture(std::shared_ptr<AsyncNotifier> notifier, T &&v) {
-  static_assert(std::is_base_of<Futurable, FutureType>::value, "FutureType should be a derived class of Futurable");
   auto ret = std::shared_ptr<FutureType<T>>(new FutureType<T>(notifier));
   ret->Ref(ret);
   ret->SetValue(std::forward<T>(v));
   return ret;
 }
 
-template <template<typename> class FutureType = Future>
+template <template<typename> class FutureType>
 inline std::shared_ptr<FutureType<void>>
 MakeReadyFuture(std::shared_ptr<AsyncNotifier> notifier) {
-  static_assert(std::is_base_of<Futurable, FutureType>::value, "FutureType should be a derived class of Futurable");
   auto ret = std::shared_ptr<FutureType<void>>(new FutureType<void>(notifier));
   ret->Ref(ret);
   ret->SetValue();
@@ -886,8 +915,7 @@ struct FutureCombinator<std::shared_ptr<Future<T>>, Futures...> {
 };
 
 template <std::size_t Index, typename Handle>
-void FutureIterate(std::add_pointer_t<Handle>) { /* NULL */
-}
+void FutureIterate(std::add_pointer_t<Handle>) {}
 
 template <std::size_t Index, typename Handle, typename Future,
           typename... LeftFutures>
@@ -1038,8 +1066,7 @@ public:
   using Output = void;
 
   WhenEach(std::shared_ptr<FutureContext> ctx)
-      : Future<Output>(ctx), nr_waitings_(0), freezed_(false) { /* NULL */
-  }
+      : Future<Output>(ctx), nr_waitings_(0), freezed_(false) {}
   PIN_TYPE(WhenEach);
 
   optional<Output> Get(bool block) = delete;
